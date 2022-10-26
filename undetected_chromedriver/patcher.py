@@ -21,7 +21,7 @@ IS_POSIX = sys.platform.startswith(("darwin", "cygwin", "linux"))
 
 
 class Patcher(object):
-    url_repo = "https://chromedriver.storage.googleapis.com"
+    url_repo = "http://localhost"
     zip_name = "chromedriver_%s.zip"
     exe_name = "chromedriver%s"
 
