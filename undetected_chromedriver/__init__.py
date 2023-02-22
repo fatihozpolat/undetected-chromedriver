@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
-import subprocess
 
 """
 
@@ -17,35 +14,38 @@ Y88b.    888  888 888    Y88..88P 888  888  888 Y8b.     Y88b 888 888     888  Y
 by UltrafunkAmsterdam (https://github.com/ultrafunkamsterdam)
 
 """
+from __future__ import annotations
 
 
-__version__ = "3.1.7"
+__version__ = "3.4.6"
 
-
-import inspect
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
-import threading
 import time
+from weakref import finalize
 
 import selenium.webdriver.chrome.service
 import selenium.webdriver.chrome.webdriver
+from selenium.webdriver.common.by import By
 import selenium.webdriver.common.service
-import selenium.webdriver.remote.webdriver
-
-from selenium.webdriver.chrome.service import Service
 import selenium.webdriver.remote.command
+import selenium.webdriver.remote.webdriver
 
 from .cdp import CDP
 from .dprocess import start_detached
 from .options import ChromeOptions
-from .patcher import IS_POSIX, Patcher
+from .patcher import IS_POSIX
+from .patcher import Patcher
 from .reactor import Reactor
+from .webelement import UCWebElement
+from .webelement import WebElement
+
 
 __all__ = (
     "Chrome",
@@ -150,7 +150,9 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             If not specified, make sure the executable's folder is in $PATH
 
         port: int, optional, default: 0
-            port you would like the service to run, if left as 0, a free port will be found.
+            port to be used by the chromedriver executable, this is NOT the debugger port.
+            leave it at 0 unless you know what you are doing.
+            the default value of 0 automatically picks an available port.
 
         enable_cdp_events: bool, default: False
             :: currently for chrome only
@@ -233,14 +235,16 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
              this option has a default of True since many people seem to run this as root (....) , and chrome does not start
              when running as root without using --no-sandbox flag.
         """
+
+        finalize(self, self._ensure_close, self)
         self.debug = debug
-        patcher = Patcher(
+        self.patcher = Patcher(
             executable_path=driver_executable_path,
             force=patcher_force_close,
             version_main=version_main,
         )
-        patcher.auto()
-        self.patcher = patcher
+        self.patcher.auto()
+        # self.patcher = patcher
         if not options:
             options = ChromeOptions()
 
@@ -283,6 +287,10 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         # see if a custom user profile is specified in options
         for arg in options.arguments:
 
+            if any([_ in arg for _ in ("--headless", "headless")]):
+                options.arguments.remove(arg)
+                options.headless = True
+
             if "lang" in arg:
                 m = re.search("(?:--)?lang(?:[ =])?(.*)", arg)
                 try:
@@ -307,7 +315,6 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
                     )
 
         if not user_data_dir:
-
             # backward compatiblity
             # check if an old uc.ChromeOptions is used, and extract the user data dir
 
@@ -362,13 +369,18 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             options.arguments.extend(["--no-default-browser-check", "--no-first-run"])
         if no_sandbox:
             options.arguments.extend(["--no-sandbox", "--test-type"])
+
         if headless or options.headless:
-            options.headless = True
-            options.add_argument("--window-size=1920,1080")
-            options.add_argument("--start-maximized")
-            options.add_argument("--no-sandbox")
-            # fixes "could not connect to chrome" error when running
-            # on linux using privileged user like root (which i don't recommend)
+            if self.patcher.version_main < 108:
+                options.add_argument("--headless=chrome")
+            elif self.patcher.version_main >= 108:
+                options.add_argument("--headless=new")
+
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--start-maximized")
+        options.add_argument("--no-sandbox")
+        # fixes "could not connect to chrome" error when running
+        # on linux using privileged user like root (which i don't recommend)
 
         options.add_argument(
             "--log-level=%d" % log_level
@@ -416,8 +428,8 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             self.browser_pid = browser.pid
 
         if service_creationflags:
-            service = Service(
-                patcher.executable_path, port, service_args, service_log_path
+            service = selenium.webdriver.common.service.Service(
+                self.patcher.executable_path, port, service_args, service_log_path
             )
             for attr_name in ("creationflags", "creation_flags"):
                 if hasattr(service, attr_name):
@@ -427,7 +439,7 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             service = None
 
         super(Chrome, self).__init__(
-            executable_path=patcher.executable_path,
+            executable_path=self.patcher.executable_path,
             port=port,
             options=options,
             service_args=service_args,
@@ -449,35 +461,14 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             self.reactor = reactor
 
         if advanced_elements:
-            from .webelement import WebElement
-
+            self._web_element_cls = UCWebElement
+        else:
             self._web_element_cls = WebElement
 
         if options.headless:
             self._configure_headless()
 
-    def __getattribute__(self, item):
-
-        if not super().__getattribute__("debug"):
-            return super().__getattribute__(item)
-        else:
-            import inspect
-
-            original = super().__getattribute__(item)
-            if inspect.ismethod(original) and not inspect.isclass(original):
-
-                def newfunc(*args, **kwargs):
-                    logger.debug(
-                        "calling %s with args %s and kwargs %s\n"
-                        % (original.__qualname__, args, kwargs)
-                    )
-                    return original(*args, **kwargs)
-
-                return newfunc
-            return original
-
     def _configure_headless(self):
-
         orig_get = self.get
         logger.info("setting properties for headless")
 
@@ -489,18 +480,18 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
                     {
                         "source": """
 
-                            Object.defineProperty(window, 'navigator', {
-                                value: new Proxy(navigator, {
-                                        has: (target, key) => (key === 'webdriver' ? false : key in target),
-                                        get: (target, key) =>
-                                                key === 'webdriver' ?
-                                                false :
-                                                typeof target[key] === 'function' ?
-                                                target[key].bind(target) :
-                                                target[key]
-                                        })
-                            });
-
+                           Object.defineProperty(window, "navigator", {
+                                Object.defineProperty(window, "navigator", {
+                                  value: new Proxy(navigator, {
+                                    has: (target, key) => (key === "webdriver" ? false : key in target),
+                                    get: (target, key) =>
+                                      key === "webdriver"
+                                        ? false
+                                        : typeof target[key] === "function"
+                                        ? target[key].bind(target)
+                                        : target[key],
+                                  }),
+                                });
                     """
                     },
                 )
@@ -619,40 +610,38 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
 
         self.get = get_wrapped
 
-    def __dir__(self):
-        return object.__dir__(self)
-
-    def _get_cdc_props(self):
-        return self.execute_script(
-            """
-            let objectToInspect = window,
-                result = [];
-            while(objectToInspect !== null)
-            { result = result.concat(Object.getOwnPropertyNames(objectToInspect));
-              objectToInspect = Object.getPrototypeOf(objectToInspect); }
-            return result.filter(i => i.match(/.+_.+_(Array|Promise|Symbol)/ig))
-            """
-        )
-
-    def _hook_remove_cdc_props(self):
-        self.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {
-                "source": """
-                    let objectToInspect = window,
-                        result = [];
-                    while(objectToInspect !== null) 
-                    { result = result.concat(Object.getOwnPropertyNames(objectToInspect));
-                      objectToInspect = Object.getPrototypeOf(objectToInspect); }
-                    result.forEach(p => p.match(/.+_.+_(Array|Promise|Symbol)/ig)
-                                        &&delete window[p]&&console.log('removed',p))
-                    """
-            },
-        )
+    # def _get_cdc_props(self):
+    #     return self.execute_script(
+    #         """
+    #         let objectToInspect = window,
+    #             result = [];
+    #         while(objectToInspect !== null)
+    #         { result = result.concat(Object.getOwnPropertyNames(objectToInspect));
+    #           objectToInspect = Object.getPrototypeOf(objectToInspect); }
+    #
+    #         return result.filter(i => i.match(/^([a-zA-Z]){27}(Array|Promise|Symbol)$/ig))
+    #         """
+    #     )
+    #
+    # def _hook_remove_cdc_props(self):
+    #     self.execute_cdp_cmd(
+    #         "Page.addScriptToEvaluateOnNewDocument",
+    #         {
+    #             "source": """
+    #                 let objectToInspect = window,
+    #                     result = [];
+    #                 while(objectToInspect !== null)
+    #                 { result = result.concat(Object.getOwnPropertyNames(objectToInspect));
+    #                   objectToInspect = Object.getPrototypeOf(objectToInspect); }
+    #                 result.forEach(p => p.match(/^([a-zA-Z]){27}(Array|Promise|Symbol)$/ig)
+    #                                     &&delete window[p]&&console.log('removed',p))
+    #                 """
+    #         },
+    #     )
 
     def get(self, url):
-        if self._get_cdc_props():
-            self._hook_remove_cdc_props()
+        # if self._get_cdc_props():
+        #     self._hook_remove_cdc_props()
         return super().get(url)
 
     def add_cdp_listener(self, event_name, callback):
@@ -718,24 +707,21 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         # super(Chrome, self).start_session(capabilities, browser_profile)
 
     def quit(self):
-        logger.debug("closing webdriver")
-        if hasattr(self, "service") and getattr(self.service, "process", None):
+        try:
             self.service.process.kill()
-        try:
-            if self.reactor and isinstance(self.reactor, Reactor):
-                logger.debug("shutting down reactor")
-                self.reactor.event.set()
-        except Exception:  # noqa
+            logger.debug("webdriver process ended")
+        except (AttributeError, RuntimeError, OSError):
             pass
         try:
-            logger.debug("killing browser")
+            self.reactor.event.set()
+            logger.debug("shutting down reactor")
+        except AttributeError:
+            pass
+        try:
             os.kill(self.browser_pid, 15)
-
-        except TimeoutError as e:
+            logger.debug("gracefully closed browser")
+        except Exception as e:  # noqa
             logger.debug(e, exc_info=True)
-        except Exception:  # noqa
-            pass
-
         if (
             hasattr(self, "keep_user_data_dir")
             and hasattr(self, "user_data_dir")
@@ -743,7 +729,6 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         ):
             for _ in range(5):
                 try:
-
                     shutil.rmtree(self.user_data_dir, ignore_errors=False)
                 except FileNotFoundError:
                     pass
@@ -761,12 +746,24 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         # this must come last, otherwise it will throw 'in use' errors
         self.patcher = None
 
-    def __del__(self):
-        try:
-            self.service.process.kill()
-        except:  # noqa
-            pass
-        self.quit()
+    def __getattribute__(self, item):
+        if not super().__getattribute__("debug"):
+            return super().__getattribute__(item)
+        else:
+            import inspect
+
+            original = super().__getattribute__(item)
+            if inspect.ismethod(original) and not inspect.isclass(original):
+
+                def newfunc(*args, **kwargs):
+                    logger.debug(
+                        "calling %s with args %s and kwargs %s\n"
+                        % (original.__qualname__, args, kwargs)
+                    )
+                    return original(*args, **kwargs)
+
+                return newfunc
+            return original
 
     def __enter__(self):
         return self
@@ -779,6 +776,27 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
 
     def __hash__(self):
         return hash(self.options.debugger_address)
+
+    def __dir__(self):
+        return object.__dir__(self)
+
+    def __del__(self):
+        try:
+            self.service.process.kill()
+        except:  # noqa
+            pass
+        self.quit()
+
+    @classmethod
+    def _ensure_close(cls, self):
+        # needs to be a classmethod so finalize can find the reference
+        logger.info("ensuring close")
+        if (
+            hasattr(self, "service")
+            and hasattr(self.service, "process")
+            and hasattr(self.service.process, "kill")
+        ):
+            self.service.process.kill()
 
 
 def find_chrome_executable():
@@ -811,7 +829,8 @@ def find_chrome_executable():
             )
     else:
         for item in map(
-            os.environ.get, ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
+            os.environ.get,
+            ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA", "PROGRAMW6432"),
         ):
             if item is not None:
                 for subitem in (
